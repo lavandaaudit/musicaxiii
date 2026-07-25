@@ -27,19 +27,21 @@
             </div>
         </header>
 
-        <!-- ============ SEQUENCER ============ -->
+        <!-- ============ TRANSPORT (master clock) ============ -->
         <section class="module seq-section">
             <div class="seq-controls">
                 <button id="seq-play">PLAY</button>
                 <button id="seq-stop">STOP</button>
-                <button id="seq-clear" class="danger">CLR</button>
                 <div class="tempo-control">
                     <label>BPM</label>
                     <input type="number" id="bpm-input" value="90" min="30" max="240">
                 </div>
-                <span style="color:#555; font-size:0.6rem;">Click a piano key first to select a note, then click step to place it. Same note on existing step updates pitch.</span>
+                <span style="color:#555; font-size:0.6rem;">Master clock — each channel has its own 16-step sequencer below the channel controls. Click a piano key first, then click a step in the channel to place a note.</span>
             </div>
-            <div class="step-grid" id="step-grid"></div>
+            <div style="padding:6px 8px; display:flex; gap:4px; align-items:center;">
+                <span style="color:var(--text-dim); font-size:0.6rem; font-family:var(--font-heading); letter-spacing:1px;">MASTER STEP:</span>
+                <div id="master-step-display" style="display:flex; gap:1px; flex:1; height:18px;"></div>
+            </div>
         </section>
 
         <!-- ============ MAIN AREA ============ -->
@@ -162,8 +164,17 @@
             this.heldNotes = new Set();   // freqs held by HOLD
             this.activeNotes = new Map(); // freq -> count of physical keypresses
 
+            // Currently selected note (used by channel sequencers when placing notes on steps)
+            this.selectedNote = 220;       // A3
+            this.selectedNoteName = 'A3';
+
             // LFO (global, can be patched to filter/pan/etc via UI mod matrix)
             // — kept minimal in this version; per-channel FX have their own LFOs
+        }
+
+        setSelectNote(freq, name) {
+            this.selectedNote = freq;
+            this.selectedNoteName = name;
         }
 
         addChannel(config = {}) {
@@ -399,7 +410,8 @@
                     { active: false, p1: 0.5, p2: 0.5, mix: 0.5 },
                     { active: false, p1: 0.5, p2: 0.5, mix: 0.5 },
                     { active: false, p1: 0.5, p2: 0.5, mix: 0.5 }
-                ]
+                ],
+                droneMode: false
             }, config);
 
             // ===== Signal chain nodes =====
@@ -442,6 +454,9 @@
                     this.fxRack.setSlot(i, this.config.fx[i], this.config.fxParams[i]);
                 }
             }
+
+            // Per-channel sequencer
+            this.sequencer = new ChannelSequencer(this);
         }
 
         // ===== Note handling =====
@@ -477,12 +492,32 @@
         }
 
         noteOff(freq, time) {
+            // If droneMode is on, ignore noteOff — note keeps playing until drone is disabled
+            if (this.config.droneMode) return;
             if (!time) time = this.context.currentTime;
             const voice = this.activeNotes.get(freq);
             if (voice) {
                 voice.release(time, this.config.adsr);
                 this.activeNotes.delete(freq);
             }
+        }
+
+        // Toggle drone mode. When turning OFF, release all currently held notes.
+        setDroneMode(on) {
+            this.config.droneMode = on;
+            if (!on) {
+                // Release all held notes
+                const now = this.context.currentTime;
+                this.activeNotes.forEach(voice => voice.release(now, this.config.adsr));
+                this.activeNotes.clear();
+            }
+        }
+
+        // Force-release all notes (used when channel is muted/disabled)
+        releaseAllNow() {
+            const now = this.context.currentTime;
+            this.activeNotes.forEach(voice => voice.release(now, this.config.adsr));
+            this.activeNotes.clear();
         }
 
         scheduleNote(freq, time, duration) {
@@ -535,7 +570,10 @@
             this.config.active = isActive;
             const target = isActive ? this.config.volume : 0;
             this.volume.gain.setTargetAtTime(target, this.context.currentTime, 0.05);
-            if (!isActive) this.releaseAll();
+            if (!isActive) {
+                // Mute also kills drone and sequencer to avoid surprises
+                this.releaseAllNow();
+            }
         }
 
         setFilterCutoff(v) {
@@ -568,6 +606,12 @@
         }
 
         dispose() {
+            // Stop sequencer and release all voices
+            if (this.sequencer) {
+                this.sequencer.setEnabled(false);
+                this.sequencer.onStepChange = null;
+            }
+            this.releaseAllNow();
             this.voices.forEach(v => v.dispose());
             this.voices = [];
             this.activeNotes.clear();
@@ -1060,28 +1104,18 @@
         }
     }
 
-    // ============== SEQUENCER ==============
+    // ============== MASTER TRANSPORT (global clock) ==============
     class Sequencer {
         constructor(audioCore) {
             this.audioCore = audioCore;
             this.isPlaying = false;
             this.tempo = 90;
             this.currentStep = 0;
+            this.maxSteps = 16;            // master clock length
             this.nextNoteTime = 0.0;
             this.scheduleAheadTime = 0.1;
-
-            this.selectedNote = 220; // A3
-            this.selectedNoteName = "A3";
-
-            this.steps = Array(32).fill(null).map(() => ({
-                active: false,
-                note: null,
-                noteName: '',
-                gate: 0.8
-            }));
-
             this.timerID = null;
-            this.onStepChange = null;
+            this.onStepChange = null;      // callback(stepIdx) for UI updates
         }
 
         start() {
@@ -1098,19 +1132,14 @@
             this.currentStep = 0;
             clearTimeout(this.timerID);
             if (this.onStepChange) this.onStepChange(0);
-        }
-
-        clear() {
-            this.steps.forEach(s => { s.active = false; s.note = null; s.noteName = ''; });
+            // Tell all channels to stop their visual playhead
+            this.audioCore.channels.forEach(ch => {
+                if (ch.sequencer && ch.sequencer.onStepChange) ch.sequencer.onStepChange(-1);
+            });
         }
 
         setTempo(bpm) {
             this.tempo = Math.max(30, Math.min(240, bpm));
-        }
-
-        setSelectNote(freq, name) {
-            this.selectedNote = freq;
-            this.selectedNoteName = name;
         }
 
         scheduler() {
@@ -1125,30 +1154,77 @@
 
         advance() {
             const secondsPerBeat = 60.0 / this.tempo;
-            // 4 steps per beat (16th notes)
-            this.nextNoteTime += 0.25 * secondsPerBeat;
-            this.currentStep = (this.currentStep + 1) % 32;
+            this.nextNoteTime += 0.25 * secondsPerBeat; // 16th notes
+            this.currentStep = (this.currentStep + 1) % this.maxSteps;
         }
 
-        scheduleStep(stepIndex, time) {
+        scheduleStep(masterStep, time) {
+            // Update master UI
             if (this.onStepChange) {
                 const delay = Math.max(0, (time - this.audioCore.context.currentTime) * 1000);
-                setTimeout(() => { if (this.isPlaying) this.onStepChange(stepIndex); }, delay);
+                setTimeout(() => { if (this.isPlaying) this.onStepChange(masterStep); }, delay);
             }
-            const step = this.steps[stepIndex];
-            if (step.active && step.note) {
-                const duration = step.gate * (60 / this.tempo) * 0.9;
-                this.audioCore.scheduleNote(step.note, time, duration);
-            }
+            // Tell each channel sequencer to process its own step (channels may have different lengths)
+            this.audioCore.channels.forEach(ch => {
+                if (ch.sequencer) {
+                    ch.sequencer.processMasterStep(masterStep, time);
+                }
+            });
+        }
+    }
+
+    // ============== CHANNEL SEQUENCER (per-channel 16-step pattern) ==============
+    class ChannelSequencer {
+        constructor(channel) {
+            this.channel = channel;
+            this.length = 16;
+            this.enabled = false;       // master toggle for this channel's sequencer
+            this.steps = Array(32).fill(null).map(() => ({
+                active: false,
+                note: null,
+                noteName: ''
+            }));
+            this.lastStep = -1;
+            this.onStepChange = null;   // for UI highlight
         }
 
-        toggleStep(index) {
+        setLength(len) {
+            this.length = Math.max(1, Math.min(32, len));
+        }
+
+        setEnabled(on) {
+            this.enabled = on;
+            if (!on && this.onStepChange) this.onStepChange(-1);
+        }
+
+        // Called by master transport for every master step
+        processMasterStep(masterStep, time) {
+            if (!this.enabled) return;
+            const localStep = masterStep % this.length;
+            const step = this.steps[localStep];
+            // Visual update
+            if (this.onStepChange) {
+                const delay = Math.max(0, (time - this.channel.context.currentTime) * 1000);
+                setTimeout(() => {
+                    if (this.onStepChange) this.onStepChange(localStep);
+                }, delay);
+            }
+            // Audio: if active, schedule a note
+            if (step.active && step.note) {
+                const secPerBeat = 60.0 / this.channel.core.sequencer.tempo;
+                const duration = 0.25 * secPerBeat * 0.9; // ~one 16th note
+                this.channel.scheduleNote(step.note, time, duration);
+            }
+            this.lastStep = localStep;
+        }
+
+        toggleStep(index, currentNote, currentNoteName) {
             const step = this.steps[index];
             if (step.active) {
                 // If different note selected, update pitch
-                if (step.note && Math.abs(step.note - this.selectedNote) > 0.1) {
-                    step.note = this.selectedNote;
-                    step.noteName = this.selectedNoteName;
+                if (step.note && Math.abs(step.note - currentNote) > 0.1) {
+                    step.note = currentNote;
+                    step.noteName = currentNoteName;
                     return "updated";
                 }
                 step.active = false;
@@ -1156,10 +1232,37 @@
                 step.noteName = '';
             } else {
                 step.active = true;
-                step.note = this.selectedNote;
-                step.noteName = this.selectedNoteName;
+                step.note = currentNote;
+                step.noteName = currentNoteName;
             }
             return step.active ? "active" : "inactive";
+        }
+
+        clear() {
+            this.steps.forEach(s => { s.active = false; s.note = null; s.noteName = ''; });
+        }
+
+        serialize() {
+            return {
+                length: this.length,
+                enabled: this.enabled,
+                steps: this.steps.map(s => ({ active: s.active, note: s.note, noteName: s.noteName }))
+            };
+        }
+
+        deserialize(data) {
+            if (!data) return;
+            this.length = data.length || 16;
+            this.enabled = !!data.enabled;
+            if (data.steps) {
+                for (let i = 0; i < 32; i++) {
+                    if (data.steps[i]) {
+                        this.steps[i] = { ...data.steps[i] };
+                    } else {
+                        this.steps[i] = { active: false, note: null, noteName: '' };
+                    }
+                }
+            }
         }
     }
 
@@ -1305,8 +1408,8 @@
         async init() {
             this.setupMaster();
             this.setupTransport();
+            this.renderMasterStepDisplay();
             this.setupKeyboard();
-            this.renderSequencer();
             this.renderInitialChannels();
             this.renderKeyboard();
             this.startVisualizer();
@@ -1474,67 +1577,49 @@
             }
         }
 
-        // ===== Transport / Sequencer =====
+        // ===== Transport (master clock only — patterns live per channel) =====
         setupTransport() {
             document.getElementById('seq-play').addEventListener('click', () => {
                 this.app.audioCore.resume();
                 this.app.sequencer.start();
                 document.getElementById('seq-play').classList.add('active');
-                document.getElementById('seq-stop').classList.remove('active');
             });
             document.getElementById('seq-stop').addEventListener('click', () => {
                 this.app.sequencer.stop();
                 document.getElementById('seq-play').classList.remove('active');
-                document.querySelectorAll('.step-btn').forEach(b => b.classList.remove('current'));
-            });
-            document.getElementById('seq-clear').addEventListener('click', () => {
-                this.app.sequencer.clear();
-                this.refreshStepUI();
+                document.querySelectorAll('.master-step-led').forEach(b => b.classList.remove('current'));
             });
             document.getElementById('bpm-input').addEventListener('change', (e) => {
                 this.app.sequencer.setTempo(parseFloat(e.target.value));
             });
         }
 
-        renderSequencer() {
-            const grid = document.getElementById('step-grid');
-            grid.innerHTML = '';
-            for (let i = 0; i < 32; i++) {
-                const step = document.createElement('div');
-                step.className = 'step-btn';
-                step.dataset.index = i;
-
-                const label = document.createElement('div');
-                label.className = 'step-label';
-                step.appendChild(label);
-
-                step.addEventListener('click', () => {
-                    const status = this.app.sequencer.toggleStep(i);
-                    this.refreshStepUI();
-                });
-                grid.appendChild(step);
+        renderMasterStepDisplay() {
+            const container = document.getElementById('master-step-display');
+            container.innerHTML = '';
+            for (let i = 0; i < 16; i++) {
+                const led = document.createElement('div');
+                led.className = 'master-step-led';
+                led.style.flex = '1';
+                led.style.background = '#1a1a1a';
+                led.style.border = '1px solid #2a2a2a';
+                led.style.borderRadius = '1px';
+                led.style.transition = 'all 0.05s';
+                if (i % 4 === 0) led.style.borderLeft = '1px solid #555';
+                container.appendChild(led);
             }
-
             this.app.sequencer.onStepChange = (idx) => {
-                document.querySelectorAll('.step-btn').forEach(s => s.classList.remove('current'));
-                const els = document.querySelectorAll('.step-btn');
-                if (els[idx]) els[idx].classList.add('current');
+                const leds = container.querySelectorAll('.master-step-led');
+                leds.forEach((led, i) => {
+                    if (i === idx) {
+                        led.style.background = 'var(--accent-color)';
+                        led.style.boxShadow = '0 0 4px var(--accent-color)';
+                    } else {
+                        led.style.background = '#1a1a1a';
+                        led.style.boxShadow = 'none';
+                    }
+                });
             };
-        }
-
-        refreshStepUI() {
-            const steps = document.querySelectorAll('.step-btn');
-            this.app.sequencer.steps.forEach((s, i) => {
-                const el = steps[i];
-                if (!el) return;
-                if (s.active) {
-                    el.classList.add('enabled');
-                    el.querySelector('.step-label').textContent = s.noteName || '';
-                } else {
-                    el.classList.remove('enabled');
-                    el.querySelector('.step-label').textContent = '';
-                }
-            });
         }
 
         // ===== Channels =====
@@ -1605,9 +1690,10 @@
 
             // ===== OSC section =====
             const oscSec = this.makeSection('OSCILLATOR');
-            // Toggle row: ON/MUTE
-            const oscToggleRow = document.createElement('div');
-            oscToggleRow.className = 'ch-toggle-row';
+            // Mode row: ON/MUTE + DRONE toggle
+            const oscModeRow = document.createElement('div');
+            oscModeRow.className = 'ch-mode-row';
+
             const onBtn = document.createElement('button');
             onBtn.textContent = ch.config.active ? 'ON' : 'MUTE';
             onBtn.classList.toggle('active', ch.config.active);
@@ -1618,8 +1704,21 @@
                 onBtn.textContent = newState ? 'ON' : 'MUTE';
                 col.classList.toggle('muted', !newState);
             });
-            oscToggleRow.appendChild(onBtn);
-            oscSec.appendChild(oscToggleRow);
+
+            const droneBtn = document.createElement('button');
+            droneBtn.textContent = 'DRONE';
+            droneBtn.className = 'drone-btn';
+            droneBtn.classList.toggle('active', ch.config.droneMode);
+            droneBtn.title = 'When ON, notes play continuously without releasing — perfect for ambient drones. Click a piano key to start a drone; click DRONE again to release all.';
+            droneBtn.addEventListener('click', () => {
+                const newState = !ch.config.droneMode;
+                ch.setDroneMode(newState);
+                droneBtn.classList.toggle('active', newState);
+            });
+
+            oscModeRow.appendChild(onBtn);
+            oscModeRow.appendChild(droneBtn);
+            oscSec.appendChild(oscModeRow);
 
             // Waveform select
             const waveSel = document.createElement('select');
@@ -1717,7 +1816,130 @@
             }
             body.appendChild(fxSec);
 
+            // ===== SEQUENCER (per-channel 16-step) =====
+            body.appendChild(this.makeChannelSequencer(ch));
+
             bank.appendChild(col);
+        }
+
+        // ===== Channel Sequencer UI =====
+        makeChannelSequencer(ch) {
+            const sec = this.makeSection('SEQUENCER');
+            const seq = ch.sequencer;
+
+            // Controls: ENABLE toggle, length selector, CLEAR
+            const ctrl = document.createElement('div');
+            ctrl.className = 'ch-seq-controls';
+
+            const enBtn = document.createElement('button');
+            enBtn.textContent = 'RUN';
+            enBtn.classList.toggle('active', seq.enabled);
+            enBtn.title = 'Enable this channel\'s sequencer (master transport must be PLAYING)';
+            enBtn.addEventListener('click', () => {
+                const newState = !seq.enabled;
+                seq.setEnabled(newState);
+                enBtn.classList.toggle('active', newState);
+            });
+
+            const lenSel = document.createElement('select');
+            [
+                { v: 8, t: '8 STEPS' },
+                { v: 12, t: '12 STEPS' },
+                { v: 16, t: '16 STEPS' },
+                { v: 32, t: '32 STEPS' }
+            ].forEach(o => {
+                const opt = document.createElement('option');
+                opt.value = o.v; opt.textContent = o.t;
+                lenSel.appendChild(opt);
+            });
+            lenSel.value = String(seq.length);
+            lenSel.addEventListener('change', e => {
+                seq.setLength(parseInt(e.target.value));
+                this.refreshChannelSeqUI(ch);
+            });
+
+            const clrBtn = document.createElement('button');
+            clrBtn.textContent = 'CLR';
+            clrBtn.className = 'danger';
+            clrBtn.addEventListener('click', () => {
+                seq.clear();
+                this.refreshChannelSeqUI(ch);
+            });
+
+            ctrl.appendChild(enBtn);
+            ctrl.appendChild(lenSel);
+            ctrl.appendChild(clrBtn);
+            sec.appendChild(ctrl);
+
+            // Step grid (max 32 — visually shows 16, scroll if more)
+            const grid = document.createElement('div');
+            grid.className = 'ch-seq-grid';
+            grid.style.gridTemplateColumns = seq.length > 16 ? 'repeat(16, 1fr)' : `repeat(${seq.length}, 1fr)`;
+            grid.style.gridTemplateRows = seq.length > 16 ? 'repeat(2, 1fr)' : '1fr';
+            grid.dataset.chIdx = ch.index;
+            grid.dataset.length = seq.length;
+
+            for (let i = 0; i < 32; i++) {
+                const stepEl = document.createElement('div');
+                stepEl.className = 'ch-seq-step';
+                stepEl.dataset.idx = i;
+                stepEl.title = `Step ${i + 1}`;
+                stepEl.addEventListener('click', () => {
+                    // Use the note currently selected by piano/computer keyboard
+                    const selNote = this.app.audioCore.selectedNote || 220;
+                    const selName = this.app.audioCore.selectedNoteName || 'A3';
+                    seq.toggleStep(i, selNote, selName);
+                    this.refreshChannelSeqUI(ch);
+                });
+                grid.appendChild(stepEl);
+            }
+
+            sec.appendChild(grid);
+
+            // Store ref so we can refresh on UI updates
+            ch._seqGrid = grid;
+
+            // Hook sequencer's step callback to update playhead
+            seq.onStepChange = (idx) => {
+                const steps = grid.querySelectorAll('.ch-seq-step');
+                steps.forEach((s, i) => {
+                    s.classList.toggle('current', i === idx);
+                });
+            };
+
+            this.refreshChannelSeqUI(ch);
+            return sec;
+        }
+
+        // Refresh a channel's sequencer grid (visibility, enabled state, note labels)
+        refreshChannelSeqUI(ch) {
+            if (!ch._seqGrid) return;
+            const grid = ch._seqGrid;
+            const seq = ch.sequencer;
+            const len = seq.length;
+
+            // Update grid layout based on length
+            grid.style.gridTemplateColumns = len > 16 ? 'repeat(16, 1fr)' : `repeat(${len}, 1fr)`;
+            grid.style.gridTemplateRows = len > 16 ? 'repeat(2, 1fr)' : '1fr';
+
+            const steps = grid.querySelectorAll('.ch-seq-step');
+            steps.forEach((s, i) => {
+                if (i < len) {
+                    s.style.display = '';
+                    const sd = seq.steps[i];
+                    if (sd && sd.active) {
+                        s.classList.add('enabled');
+                        s.textContent = sd.noteName ? sd.noteName.substring(0, 2) : '';
+                    } else {
+                        s.classList.remove('enabled');
+                        s.textContent = '';
+                    }
+                } else {
+                    s.style.display = 'none';
+                    s.classList.remove('enabled', 'current');
+                    s.textContent = '';
+                }
+            });
         }
 
         makeSection(title) {
@@ -1903,7 +2125,7 @@
             // even if context is still resuming (noteOn uses context.currentTime).
             this.app.audioCore.resume();
             this.app.audioCore.noteOn(freq);
-            this.app.sequencer.setSelectNote(freq, name);
+            this.app.audioCore.setSelectNote(freq, name);
             // Highlight
             document.querySelectorAll('.piano-key.active-note').forEach(k => {
                 if (parseFloat(k.dataset.freq) !== freq) k.classList.remove('active-note');
@@ -1928,7 +2150,7 @@
                     this.activeKeys.add(e.key);
                     this.app.audioCore.resume();
                     this.app.audioCore.noteOn(freq);
-                    this.app.sequencer.setSelectNote(freq, e.key.toUpperCase());
+                    this.app.audioCore.setSelectNote(freq, e.key.toUpperCase());
                     // Visual feedback on virtual keyboard
                     const keyEl = document.querySelector(`.piano-key[data-freq="${freq}"]`);
                     if (keyEl) keyEl.classList.add('active-note');
@@ -2125,14 +2347,17 @@
 
         serialize() {
             return {
-                version: 2,
-                channels: this.app.audioCore.channels.map(ch => JSON.parse(JSON.stringify(ch.config))),
+                version: 3,
+                channels: this.app.audioCore.channels.map(ch => {
+                    const cfg = JSON.parse(JSON.stringify(ch.config));
+                    cfg.sequencer = ch.sequencer.serialize();
+                    return cfg;
+                }),
                 master: {
                     volume: this.app.audioCore.masterMix.gain.value,
                     low: this.app.audioCore.masterEQ_low.gain.value,
                     high: this.app.audioCore.masterEQ_high.gain.value
                 },
-                sequencer: this.app.sequencer.steps.map(s => ({ ...s })),
                 tempo: this.app.sequencer.tempo
             };
         }
@@ -2149,7 +2374,10 @@
 
             // Add channels from config (deep clone to avoid reference issues)
             data.channels.forEach(cfg => {
+                const seqData = cfg.sequencer;
+                delete cfg.sequencer;
                 const ch = this.app.audioCore.addChannel(JSON.parse(JSON.stringify(cfg)));
+                if (seqData) ch.sequencer.deserialize(seqData);
                 this.app.ui.renderChannel(ch);
             });
 
@@ -2160,11 +2388,6 @@
                 this.app.audioCore.masterEQ_high.gain.value = data.master.high;
             }
 
-            // Sequencer
-            if (data.sequencer) {
-                this.app.sequencer.steps = data.sequencer.map(s => ({ ...s }));
-                this.app.ui.refreshStepUI();
-            }
             if (data.tempo) {
                 this.app.sequencer.tempo = data.tempo;
                 const bpmInput = document.getElementById('bpm-input');
