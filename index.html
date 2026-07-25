@@ -1131,7 +1131,7 @@
             this.isPlaying = false;
             this.currentStep = 0;
             clearTimeout(this.timerID);
-            if (this.onStepChange) this.onStepChange(0);
+            if (this.onStepChange) this.onStepChange(-1);
             // Tell all channels to stop their visual playhead
             this.audioCore.channels.forEach(ch => {
                 if (ch.sequencer && ch.sequencer.onStepChange) ch.sequencer.onStepChange(-1);
@@ -1199,19 +1199,30 @@
 
         // Called by master transport for every master step
         processMasterStep(masterStep, time) {
-            // Gate on channel active state — if channel is muted, sequencer is silent
-            if (!this.channel.config.active) return;
             const localStep = masterStep % this.length;
             const step = this.steps[localStep];
-            // Visual update
+
+            // Visual playhead ALWAYS advances when master transport is playing,
+            // even if the channel is muted — this avoids "frozen playhead" bugs
+            // when the user toggles mute on/off mid-pattern.
             if (this.onStepChange) {
-                const delay = Math.max(0, (time - this.channel.context.currentTime) * 1000);
+                const ctxNow = this.channel.context.currentTime;
+                const delay = Math.max(0, (time - ctxNow) * 1000);
                 setTimeout(() => {
+                    // Bail out if transport was stopped between scheduling and firing
+                    if (!this.channel.core.sequencer.isPlaying) return;
                     if (this.onStepChange) this.onStepChange(localStep);
                 }, delay);
             }
-            // Audio: if active, schedule a note. Drone mode is handled inside the
-            // channel's noteOn/noteOff — noteOff is a no-op when droneMode is on,
+
+            // Audio: only schedule notes if channel is active (not muted)
+            if (!this.channel.config.active) {
+                this.lastStep = localStep;
+                return;
+            }
+
+            // Schedule the note. Drone mode is handled inside the channel's
+            // noteOn/noteOff — noteOff is a no-op when droneMode is on,
             // so the sequencer note effectively becomes a sustained drone hit.
             if (step.active && step.note) {
                 const secPerBeat = 60.0 / this.channel.core.sequencer.tempo;
@@ -1590,7 +1601,6 @@
             document.getElementById('seq-stop').addEventListener('click', () => {
                 this.app.sequencer.stop();
                 document.getElementById('seq-play').classList.remove('active');
-                document.querySelectorAll('.master-step-led').forEach(b => b.classList.remove('current'));
             });
             document.getElementById('bpm-input').addEventListener('change', (e) => {
                 this.app.sequencer.setTempo(parseFloat(e.target.value));
@@ -1690,6 +1700,9 @@
             const body = document.createElement('div');
             body.className = 'channel-body';
             col.appendChild(body);
+
+            // ===== SEQUENCER (per-channel, on top so it's always visible) =====
+            body.appendChild(this.makeChannelSequencer(ch));
 
             // ===== OSC section =====
             const oscSec = this.makeSection('OSCILLATOR');
@@ -1819,14 +1832,12 @@
             }
             body.appendChild(fxSec);
 
-            // ===== SEQUENCER (per-channel 16-step) =====
-            body.appendChild(this.makeChannelSequencer(ch));
-
             bank.appendChild(col);
         }
 
         // ===== Channel Sequencer UI =====
-        // Sequencer is always visible under the channel. It auto-plays when:
+        // Sequencer is rendered at the TOP of each channel column (above OSCILLATOR),
+        // so it's always visible without scrolling. It auto-plays when:
         //   1) channel is ON (not muted), AND
         //   2) master transport is PLAYING
         // DRONE mode takes precedence — when DRONE is on, the sequencer still
