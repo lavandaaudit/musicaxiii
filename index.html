@@ -18,7 +18,11 @@
             <h1>LIVE MODULARXIII</h1>
             <div class="master-controls">
                 <button id="power-btn">POWER</button>
+                <button id="test-btn">TEST</button>
                 <button id="hold-btn" class="warn">HOLD</button>
+                <button id="midi-btn">MIDI</button>
+                <button id="rec-btn" class="rec">REC</button>
+                <button id="patch-btn">PATCH</button>
                 <div class="master-knob-group" id="master-knobs"></div>
             </div>
         </header>
@@ -75,7 +79,29 @@
         </div>
     </div>
 
+    <!-- ============ PATCH LIBRARY MODAL ============ -->
+    <div id="patch-modal" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>PATCH LIBRARY</h3>
+                <button id="patch-close" class="modal-close">×</button>
+            </div>
+            <div id="patch-slots"></div>
+            <div style="margin-top:12px; padding-top:8px; border-top:1px solid var(--border-color); color:var(--text-dim); font-size:0.6rem; text-align:center;">
+                Saves full state: channels, FX, ADSR, master, sequencer. Stored locally in your browser.
+            </div>
+        </div>
+    </div>
+
     <script>
+    // Global error handlers — surface issues to console so user can see what's wrong
+    window.addEventListener('error', (e) => {
+        console.error('[MODULARXIII ERROR]', e.message, e.filename + ':' + e.lineno);
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+        console.error('[MODULARXIII PROMISE ERROR]', e.reason);
+    });
+
     /* ============================================================
        LIVE MODULARXIII — Modular Ambient Synthesizer
        Architecture:
@@ -161,7 +187,12 @@
         }
 
         resume() {
-            if (this.context.state === 'suspended') this.context.resume();
+            // Resume the audio context (must be called from a user gesture).
+            // Returns a Promise that resolves once the context is actually running.
+            if (this.context.state === 'suspended') {
+                return this.context.resume();
+            }
+            return Promise.resolve();
         }
 
         noteOn(freq) {
@@ -203,6 +234,72 @@
                 this.heldNotes.clear();
             }
             return this.holdMode;
+        }
+
+        // ===== MIDI INPUT (Web MIDI API) =====
+        async initMIDI() {
+            if (!navigator.requestMIDIAccess) {
+                return { ok: false, reason: 'not-supported' };
+            }
+            try {
+                const access = await navigator.requestMIDIAccess();
+                this.midiAccess = access;
+                const inputs = access.inputs;
+                if (inputs.size === 0) {
+                    return { ok: false, reason: 'no-devices' };
+                }
+                const bindInputs = () => {
+                    inputs.forEach(input => {
+                        input.onmidimessage = (e) => this.handleMIDIMessage(e);
+                    });
+                };
+                bindInputs();
+                access.onstatechange = bindInputs;
+                return { ok: true, count: inputs.size };
+            } catch (e) {
+                return { ok: false, reason: 'denied' };
+            }
+        }
+
+        handleMIDIMessage(e) {
+            const [status, data1, data2] = e.data;
+            const cmd = status & 0xf0;
+            // Note On
+            if (cmd === 0x90 && data2 > 0) {
+                const freq = 440 * Math.pow(2, (data1 - 69) / 12);
+                this.noteOn(freq);
+                this._notifyMIDIVisual(freq, true);
+            }
+            // Note Off
+            else if (cmd === 0x80 || (cmd === 0x90 && data2 === 0)) {
+                const freq = 440 * Math.pow(2, (data1 - 69) / 12);
+                this.noteOff(freq);
+                this._notifyMIDIVisual(freq, false);
+            }
+            // Sustain pedal (CC 64)
+            else if (cmd === 0xb0 && data1 === 64) {
+                const shouldHold = data2 >= 64;
+                if (shouldHold !== this.holdMode) {
+                    this.toggleHold();
+                    // Update UI to match
+                    const btn = document.getElementById('hold-btn');
+                    if (btn) btn.classList.toggle('active', this.holdMode);
+                    const ind = document.getElementById('hold-indicator');
+                    if (ind) {
+                        ind.textContent = `HOLD: ${this.holdMode ? 'ON' : 'OFF'}`;
+                        ind.classList.toggle('active', this.holdMode);
+                    }
+                }
+            }
+        }
+
+        _notifyMIDIVisual(freq, isOn) {
+            // Highlight the virtual piano key for the MIDI note
+            const keyEl = document.querySelector(`.piano-key[data-freq="${freq.toFixed(2)}"]`);
+            if (keyEl) {
+                if (isOn) keyEl.classList.add('active-note');
+                else if (!this.holdMode) keyEl.classList.remove('active-note');
+            }
         }
 
         // For sequencer — schedule a note on/off pair
@@ -493,6 +590,8 @@
             this.input = context.createGain();
             this.output = context.createGain();
             this.slots = [null, null, null];
+            // CRITICAL: wire input -> output by default (passthrough when all slots empty)
+            this.input.connect(this.output);
         }
 
         setSlot(idx, type, params) {
@@ -584,10 +683,18 @@
                 this.node.connect(this.wetGain);
             }
             else if (t === 'reverb') {
+                // Improved ambient reverb: preDelay -> convolver -> damping lowpass -> wet
+                this.preDelay = ctx.createDelay(1.0);
+                this.preDelay.delayTime.value = 0.02;
                 this.node = ctx.createConvolver();
                 this.node.buffer = this.makeImpulse(2.5, 2.0);
-                this.input.connect(this.node);
-                this.node.connect(this.wetGain);
+                this.damping = ctx.createBiquadFilter();
+                this.damping.type = 'lowpass';
+                this.damping.frequency.value = 5000;
+                this.input.connect(this.preDelay);
+                this.preDelay.connect(this.node);
+                this.node.connect(this.damping);
+                this.damping.connect(this.wetGain);
                 this._decay = 2.5;
             }
             else if (t === 'distortion' || t === 'overdrive') {
@@ -709,6 +816,58 @@
                 this.input.connect(this.node);
                 this.node.connect(this.wetGain);
             }
+            else if (t === 'lofi') {
+                // Bitcrush + lowpass = muffled vintage sound (great for ambient beds)
+                this.node = ctx.createWaveShaper();
+                this.node.curve = this.makeBitcrushCurve(6);
+                this.lofiFilter = ctx.createBiquadFilter();
+                this.lofiFilter.type = 'lowpass';
+                this.lofiFilter.frequency.value = 2000;
+                this.input.connect(this.node);
+                this.node.connect(this.lofiFilter);
+                this.lofiFilter.connect(this.wetGain);
+            }
+            else if (t === 'saturator') {
+                // Warm tanh saturation
+                this.node = ctx.createWaveShaper();
+                this.node.curve = this.makeSaturatorCurve(2);
+                this.input.connect(this.node);
+                this.node.connect(this.wetGain);
+            }
+            else if (t === 'width') {
+                // Haas effect stereo widener — great for ambient immersion
+                this.splitter = ctx.createChannelSplitter(2);
+                this.merger = ctx.createChannelMerger(2);
+                this.widthDelay = ctx.createDelay(0.05);
+                this.widthDelay.delayTime.value = 0.015;
+                this.widthGain = ctx.createGain();
+                this.widthGain.gain.value = 1;
+                this.input.connect(this.splitter);
+                this.splitter.connect(this.merger, 0, 0);  // L direct
+                this.splitter.connect(this.widthDelay, 1);  // R delayed
+                this.widthDelay.connect(this.widthGain);
+                this.widthGain.connect(this.merger, 0, 1);
+                this.merger.connect(this.wetGain);
+            }
+            else if (t === 'cabinet') {
+                // Guitar cabinet sim: soft saturator + bandpass
+                this.node = ctx.createWaveShaper();
+                this.node.curve = this.makeSaturatorCurve(1.5);
+                this.cabFilter = ctx.createBiquadFilter();
+                this.cabFilter.type = 'bandpass';
+                this.cabFilter.frequency.value = 1500;
+                this.cabFilter.Q.value = 1;
+                this.input.connect(this.node);
+                this.node.connect(this.cabFilter);
+                this.cabFilter.connect(this.wetGain);
+            }
+            else if (t === 'expander') {
+                // Soft noise gate via WaveShaper (kills low-level noise — useful for drones)
+                this.node = ctx.createWaveShaper();
+                this.node.curve = this.makeGateCurve(0.1, 0.9);
+                this.input.connect(this.node);
+                this.node.connect(this.wetGain);
+            }
             else {
                 // fallback passthrough
                 this.node = ctx.createGain();
@@ -722,7 +881,11 @@
             this.params.p1 = v;
             const t = this.type;
             if (t === 'delay') this.node.delayTime.value = 0.05 + v * 1.5;
-            else if (t === 'reverb') { /* decay handled in P2 for size */ }
+            else if (t === 'reverb') {
+                // P1 = decay (size) — rebuild IR
+                this._decay = 0.3 + v * 6.0;
+                this.node.buffer = this.makeImpulse(this._decay, 2.0);
+            }
             else if (t === 'distortion' || t === 'overdrive') this.node.curve = this.makeDistortionCurve(50 + v * 2000);
             else if (t === 'bitcrusher') this.node.curve = this.makeBitcrushCurve(Math.max(2, Math.round(2 + v * 14)));
             else if (t === 'filter') this.node.frequency.value = 100 + v * 8000;
@@ -733,6 +896,11 @@
             else if (t === 'ringmod') this.ringOsc.frequency.value = 10 + v * 500;
             else if (t === 'autopan') this.lfo.frequency.value = 0.2 + v * 6;
             else if (t === 'compressor') this.node.threshold.value = -60 + v * 60;
+            else if (t === 'lofi') this.node.curve = this.makeBitcrushCurve(Math.max(2, Math.round(2 + (1 - v) * 14)));
+            else if (t === 'saturator') this.node.curve = this.makeSaturatorCurve(0.5 + v * 10);
+            else if (t === 'width') this.widthDelay.delayTime.value = 0.001 + v * 0.04;
+            else if (t === 'cabinet') this.node.curve = this.makeSaturatorCurve(0.5 + v * 4);
+            else if (t === 'expander') this.node.curve = this.makeGateCurve(0.05 + v * 0.4, 0.5 + this.params.p2 * 0.5);
         }
 
         setParam2(v) {
@@ -740,9 +908,8 @@
             const t = this.type;
             if (t === 'delay') this.feedback.gain.value = v * 0.9;
             else if (t === 'reverb') {
-                // Change decay = rebuild impulse
-                this._decay = 0.5 + v * 5;
-                this.node.buffer = this.makeImpulse(this._decay, 2.0);
+                // P2 = damping (lowpass cutoff on the wet tail)
+                this.damping.frequency.value = 500 + v * 10000;
             }
             else if (t === 'filter') this.node.Q.value = 0.5 + v * 20;
             else if (t === 'tremolo') this.lfoGain.gain.value = v;
@@ -752,9 +919,11 @@
             else if (t === 'ringmod') this.ringGain.gain.value = v * 2 - 1; // -1..1
             else if (t === 'autopan') this.lfoGain.gain.value = v;
             else if (t === 'compressor') this.node.ratio.value = 1 + v * 19;
-            else if (t === 'distortion' || t === 'overdrive') {
-                // tone control — re-curve with intensity
-            }
+            else if (t === 'lofi') this.lofiFilter.frequency.value = 500 + v * 6000;
+            else if (t === 'saturator') { /* drive only — P2 reserved */ }
+            else if (t === 'width') this.widthGain.gain.value = v * 2;
+            else if (t === 'cabinet') this.cabFilter.frequency.value = 500 + v * 4000;
+            else if (t === 'expander') this.node.curve = this.makeGateCurve(0.05 + this.params.p1 * 0.4, 0.5 + v * 0.5);
         }
 
         setMix(v) {
@@ -810,6 +979,43 @@
             return curve;
         }
 
+        makeSaturatorCurve(drive) {
+            // Warm tanh saturation — adds harmonics without harsh clipping
+            const n = 4096;
+            const curve = new Float32Array(n);
+            const k = Math.max(0.1, drive);
+            for (let i = 0; i < n; i++) {
+                const x = (i * 2) / n - 1;
+                curve[i] = Math.tanh(k * x);
+            }
+            return curve;
+        }
+
+        makeGateCurve(threshold, reduction) {
+            // Soft noise gate: attenuates signals below threshold smoothly
+            const n = 4096;
+            const curve = new Float32Array(n);
+            const softness = 0.05;
+            const thr = Math.max(0.001, threshold);
+            const red = Math.max(0, Math.min(0.99, reduction));
+            for (let i = 0; i < n; i++) {
+                const x = (i * 2) / n - 1;
+                const ax = Math.abs(x);
+                let factor;
+                if (ax < thr - softness) {
+                    factor = 1 - red;
+                } else if (ax < thr + softness) {
+                    // Smooth transition between gated and open
+                    const t = (ax - (thr - softness)) / (2 * softness);
+                    factor = (1 - red) + red * t;
+                } else {
+                    factor = 1;
+                }
+                curve[i] = x * factor;
+            }
+            return curve;
+        }
+
         makeImpulse(duration, decay) {
             const rate = this.context.sampleRate;
             const length = Math.max(1, Math.floor(rate * duration));
@@ -841,6 +1047,15 @@
                 if (this.lfoGain) this.lfoGain.disconnect();
                 if (this.choDepth) this.choDepth.disconnect();
                 if (this.ringGain) this.ringGain.disconnect();
+                // New nodes for improved FX
+                if (this.preDelay) this.preDelay.disconnect();
+                if (this.damping) this.damping.disconnect();
+                if (this.lofiFilter) this.lofiFilter.disconnect();
+                if (this.cabFilter) this.cabFilter.disconnect();
+                if (this.splitter) this.splitter.disconnect();
+                if (this.merger) this.merger.disconnect();
+                if (this.widthDelay) this.widthDelay.disconnect();
+                if (this.widthGain) this.widthGain.disconnect();
             } catch (e) {}
         }
     }
@@ -1118,6 +1333,29 @@
                 document.getElementById('power-btn').classList.add('active');
             });
 
+            // TEST button — plays a 1-second 440Hz tone directly through master bus
+            // Useful for verifying audio is working without needing to use the keyboard.
+            document.getElementById('test-btn').addEventListener('click', () => {
+                const ctx = this.app.audioCore.context;
+                this.app.audioCore.resume().then(() => {
+                    const osc = ctx.createOscillator();
+                    osc.type = 'sine';
+                    osc.frequency.value = 440;
+                    const g = ctx.createGain();
+                    g.gain.value = 0;
+                    osc.connect(g);
+                    g.connect(this.app.audioCore.masterMix);
+                    const now = ctx.currentTime;
+                    g.gain.setValueAtTime(0, now);
+                    g.gain.linearRampToValueAtTime(0.3, now + 0.02);
+                    g.gain.linearRampToValueAtTime(0.3, now + 0.8);
+                    g.gain.linearRampToValueAtTime(0, now + 1.0);
+                    osc.start(now);
+                    osc.stop(now + 1.05);
+                    console.log('[MODULARXIII] Test tone: 440Hz sine for 1s. If you hear it, audio chain works.');
+                });
+            });
+
             document.getElementById('hold-btn').addEventListener('click', () => {
                 const isOn = this.app.audioCore.toggleHold();
                 const btn = document.getElementById('hold-btn');
@@ -1125,6 +1363,115 @@
                 document.getElementById('hold-indicator').textContent = `HOLD: ${isOn ? 'ON' : 'OFF'}`;
                 document.getElementById('hold-indicator').classList.toggle('active', isOn);
             });
+
+            // MIDI button
+            document.getElementById('midi-btn').addEventListener('click', async () => {
+                const btn = document.getElementById('midi-btn');
+                btn.textContent = 'MIDI...';
+                const result = await this.app.audioCore.initMIDI();
+                if (result.ok) {
+                    btn.textContent = `MIDI:${result.count}`;
+                    btn.classList.add('active');
+                } else if (result.reason === 'no-devices') {
+                    btn.textContent = 'MIDI: NONE';
+                    alert('No MIDI devices found. Connect a MIDI keyboard and try again.');
+                } else if (result.reason === 'not-supported') {
+                    btn.textContent = 'MIDI: N/A';
+                    alert('Web MIDI API not supported in this browser. Try Chrome, Edge, or Opera.');
+                } else {
+                    btn.textContent = 'MIDI: DENIED';
+                }
+            });
+
+            // REC button (WAV recorder)
+            document.getElementById('rec-btn').addEventListener('click', () => {
+                const btn = document.getElementById('rec-btn');
+                const isRecording = this.app.recorder.toggle();
+                btn.classList.toggle('active', isRecording);
+                btn.textContent = isRecording ? 'STOP' : 'REC';
+            });
+
+            // PATCH button (open library)
+            document.getElementById('patch-btn').addEventListener('click', () => {
+                this.renderPatchSlots();
+                document.getElementById('patch-modal').classList.remove('hidden');
+            });
+
+            document.getElementById('patch-close').addEventListener('click', () => {
+                document.getElementById('patch-modal').classList.add('hidden');
+            });
+
+            // Close modal when clicking outside content
+            document.getElementById('patch-modal').addEventListener('click', (e) => {
+                if (e.target.id === 'patch-modal') {
+                    document.getElementById('patch-modal').classList.add('hidden');
+                }
+            });
+        }
+
+        // ===== Patch library UI =====
+        renderPatchSlots() {
+            const container = document.getElementById('patch-slots');
+            container.innerHTML = '';
+            const patches = this.app.patchManager.list();
+
+            for (let i = 0; i < 5; i++) {
+                const slot = document.createElement('div');
+                slot.className = 'patch-slot';
+
+                const nameInput = document.createElement('input');
+                nameInput.type = 'text';
+                nameInput.placeholder = `Slot ${i + 1}`;
+                nameInput.value = patches[i] ? patches[i].name : '';
+                nameInput.className = 'patch-name';
+
+                const info = document.createElement('span');
+                info.className = 'patch-info';
+                if (patches[i]) {
+                    const d = new Date(patches[i].ts);
+                    info.textContent = `${d.toLocaleDateString()} ${d.toLocaleTimeString()}`;
+                } else {
+                    info.textContent = '— empty —';
+                }
+
+                const saveBtn = document.createElement('button');
+                saveBtn.textContent = 'SAVE';
+                saveBtn.addEventListener('click', () => {
+                    const name = nameInput.value.trim() || `Patch ${i + 1}`;
+                    if (this.app.patchManager.save(i, name)) {
+                        this.renderPatchSlots();
+                    } else {
+                        alert('Save failed — localStorage may be full.');
+                    }
+                });
+
+                const loadBtn = document.createElement('button');
+                loadBtn.textContent = 'LOAD';
+                loadBtn.disabled = !patches[i];
+                loadBtn.addEventListener('click', () => {
+                    if (this.app.patchManager.load(i)) {
+                        document.getElementById('patch-modal').classList.add('hidden');
+                    }
+                });
+
+                const delBtn = document.createElement('button');
+                delBtn.textContent = 'DEL';
+                delBtn.className = 'danger';
+                delBtn.disabled = !patches[i];
+                delBtn.addEventListener('click', () => {
+                    if (confirm(`Delete patch "${patches[i].name}"?`)) {
+                        this.app.patchManager.delete(i);
+                        this.renderPatchSlots();
+                    }
+                });
+
+                slot.appendChild(nameInput);
+                slot.appendChild(info);
+                slot.appendChild(saveBtn);
+                slot.appendChild(loadBtn);
+                slot.appendChild(delBtn);
+                container.appendChild(slot);
+            }
         }
 
         // ===== Transport / Sequencer =====
@@ -1399,9 +1746,14 @@
                 { v: 'filter', t: 'FILTER' },
                 { v: 'distortion', t: 'DISTORT' },
                 { v: 'overdrive', t: 'OVERDRV' },
+                { v: 'saturator', t: 'SATURAT' },
                 { v: 'bitcrusher', t: 'BITCRSH' },
+                { v: 'lofi', t: 'LO-FI' },
                 { v: 'ringmod', t: 'RINGMOD' },
-                { v: 'compressor', t: 'COMPRES' }
+                { v: 'cabinet', t: 'CABINET' },
+                { v: 'compressor', t: 'COMPRES' },
+                { v: 'expander', t: 'GATE' },
+                { v: 'width', t: 'ST-WIDTH' }
             ];
 
             const head = document.createElement('div');
@@ -1546,6 +1898,9 @@
         }
 
         playKey(freq, name, btn) {
+            // Resume AudioContext (must be triggered from a user gesture).
+            // We schedule the note immediately — WebAudio will queue it correctly
+            // even if context is still resuming (noteOn uses context.currentTime).
             this.app.audioCore.resume();
             this.app.audioCore.noteOn(freq);
             this.app.sequencer.setSelectNote(freq, name);
@@ -1727,23 +2082,266 @@
         }
     }
 
+    // ============== PATCH MANAGER ==============
+    class PatchManager {
+        constructor(app) {
+            this.app = app;
+            this.SLOTS_KEY = 'modularxiii_patches_v2';
+        }
+
+        save(slot, name) {
+            const data = this.serialize();
+            const patches = this.list();
+            patches[slot] = { name: name || `Patch ${slot + 1}`, data, ts: Date.now() };
+            try {
+                localStorage.setItem(this.SLOTS_KEY, JSON.stringify(patches));
+                return true;
+            } catch (e) {
+                console.error('Patch save failed:', e);
+                return false;
+            }
+        }
+
+        load(slot) {
+            const patches = this.list();
+            if (!patches[slot]) return false;
+            this.deserialize(patches[slot].data);
+            return true;
+        }
+
+        delete(slot) {
+            const patches = this.list();
+            delete patches[slot];
+            try {
+                localStorage.setItem(this.SLOTS_KEY, JSON.stringify(patches));
+            } catch (e) {}
+        }
+
+        list() {
+            try {
+                return JSON.parse(localStorage.getItem(this.SLOTS_KEY) || '{}');
+            } catch (e) { return {}; }
+        }
+
+        serialize() {
+            return {
+                version: 2,
+                channels: this.app.audioCore.channels.map(ch => JSON.parse(JSON.stringify(ch.config))),
+                master: {
+                    volume: this.app.audioCore.masterMix.gain.value,
+                    low: this.app.audioCore.masterEQ_low.gain.value,
+                    high: this.app.audioCore.masterEQ_high.gain.value
+                },
+                sequencer: this.app.sequencer.steps.map(s => ({ ...s })),
+                tempo: this.app.sequencer.tempo
+            };
+        }
+
+        deserialize(data) {
+            if (!data || !data.channels) return;
+
+            // Remove all existing channels
+            const bank = document.getElementById('osc-bank');
+            while (this.app.audioCore.channels.length > 0) {
+                this.app.audioCore.removeChannel(0);
+            }
+            bank.innerHTML = '';
+
+            // Add channels from config (deep clone to avoid reference issues)
+            data.channels.forEach(cfg => {
+                const ch = this.app.audioCore.addChannel(JSON.parse(JSON.stringify(cfg)));
+                this.app.ui.renderChannel(ch);
+            });
+
+            // Master settings
+            if (data.master) {
+                this.app.audioCore.masterMix.gain.value = data.master.volume;
+                this.app.audioCore.masterEQ_low.gain.value = data.master.low;
+                this.app.audioCore.masterEQ_high.gain.value = data.master.high;
+            }
+
+            // Sequencer
+            if (data.sequencer) {
+                this.app.sequencer.steps = data.sequencer.map(s => ({ ...s }));
+                this.app.ui.refreshStepUI();
+            }
+            if (data.tempo) {
+                this.app.sequencer.tempo = data.tempo;
+                const bpmInput = document.getElementById('bpm-input');
+                if (bpmInput) bpmInput.value = data.tempo;
+            }
+        }
+    }
+
+    // ============== RECORDER (WAV export) ==============
+    class Recorder {
+        constructor(audioCore) {
+            this.audioCore = audioCore;
+            this.dest = audioCore.context.createMediaStreamDestination();
+            audioCore.limiter.connect(this.dest);
+            this.mediaRecorder = null;
+            this.chunks = [];
+            this.isRecording = false;
+        }
+
+        start() {
+            if (this.isRecording) return;
+            this.chunks = [];
+            let options = {};
+            // Try to pick a supported mime type
+            const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
+            for (const c of candidates) {
+                if (MediaRecorder.isTypeSupported(c)) {
+                    options = { mimeType: c };
+                    break;
+                }
+            }
+            try {
+                this.mediaRecorder = new MediaRecorder(this.dest.stream, options);
+            } catch (e) {
+                this.mediaRecorder = new MediaRecorder(this.dest.stream);
+            }
+            this.mediaRecorder.ondataavailable = (e) => {
+                if (e.data.size > 0) this.chunks.push(e.data);
+            };
+            this.mediaRecorder.onstop = () => this.export();
+            this.mediaRecorder.start();
+            this.isRecording = true;
+        }
+
+        stop() {
+            if (this.mediaRecorder && this.isRecording) {
+                this.mediaRecorder.stop();
+                this.isRecording = false;
+            }
+        }
+
+        toggle() {
+            if (this.isRecording) {
+                this.stop();
+                return false;
+            } else {
+                this.start();
+                return true;
+            }
+        }
+
+        async export() {
+            if (this.chunks.length === 0) return;
+            try {
+                const blob = new Blob(this.chunks, { type: 'audio/webm' });
+                const arrayBuf = await blob.arrayBuffer();
+                const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const audioBuf = await decodeCtx.decodeAudioData(arrayBuf);
+                decodeCtx.close();
+                const wav = this.audioBufferToWav(audioBuf);
+                const url = URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }));
+                const a = document.createElement('a');
+                a.href = url;
+                const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+                a.download = `modularxiii_${ts}.wav`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+            } catch (e) {
+                console.error('WAV export failed:', e);
+                alert('Export failed: ' + e.message);
+            }
+        }
+
+        audioBufferToWav(buffer) {
+            const numCh = buffer.numberOfChannels;
+            const sampleRate = buffer.sampleRate;
+            const numSamples = buffer.length;
+            const bitDepth = 16;
+            const bytesPerSample = bitDepth / 8;
+            const blockAlign = numCh * bytesPerSample;
+            const byteRate = sampleRate * blockAlign;
+            const dataSize = numSamples * blockAlign;
+            const bufferSize = 44 + dataSize;
+
+            const arrBuf = new ArrayBuffer(bufferSize);
+            const view = new DataView(arrBuf);
+
+            const writeString = (offset, str) => {
+                for (let i = 0; i < str.length; i++) {
+                    view.setUint8(offset + i, str.charCodeAt(i));
+                }
+            };
+
+            // RIFF header
+            writeString(0, 'RIFF');
+            view.setUint32(4, 36 + dataSize, true);
+            writeString(8, 'WAVE');
+            // fmt chunk
+            writeString(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);  // PCM
+            view.setUint16(22, numCh, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, byteRate, true);
+            view.setUint16(32, blockAlign, true);
+            view.setUint16(34, bitDepth, true);
+            // data chunk
+            writeString(36, 'data');
+            view.setUint32(40, dataSize, true);
+
+            // PCM samples (interleaved)
+            const channels = [];
+            for (let c = 0; c < numCh; c++) {
+                channels.push(buffer.getChannelData(c));
+            }
+            let offset = 44;
+            for (let i = 0; i < numSamples; i++) {
+                for (let c = 0; c < numCh; c++) {
+                    const sample = Math.max(-1, Math.min(1, channels[c][i]));
+                    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+                    offset += 2;
+                }
+            }
+            return arrBuf;
+        }
+    }
+
     // ============== APP ==============
     class App {
         constructor() {
-            this.audioCore = new AudioCore();
-            this.sequencer = new Sequencer(this.audioCore);
-            this.ui = new UIController(this);
-            this.init();
+            try {
+                console.log('[MODULARXIII] Constructing App...');
+                this.audioCore = new AudioCore();
+                console.log('[MODULARXIII] AudioCore ready. State:', this.audioCore.context.state);
+                this.sequencer = new Sequencer(this.audioCore);
+                this.patchManager = new PatchManager(this);
+                this.recorder = new Recorder(this.audioCore);
+                this.ui = new UIController(this);
+                this.init();
+            } catch (e) {
+                console.error('[MODULARXIII] FATAL: App constructor failed:', e);
+                alert('MODULARXIII failed to start:\n' + e.message + '\n\nCheck console (F12) for details.');
+            }
         }
         async init() {
-            console.log('[MODULARXIII] Initializing modular synth...');
-            await this.ui.init();
-            console.log('[MODULARXIII] Ready. Channels:', this.audioCore.channels.length);
+            try {
+                console.log('[MODULARXIII] Initializing UI...');
+                await this.ui.init();
+                console.log('[MODULARXIII] Ready. Channels:', this.audioCore.channels.length);
+                console.log('[MODULARXIII] Master signal chain:');
+                console.log('  Channels → masterMix → masterEQ_low → masterEQ_high → limiter → destination');
+                console.log('[MODULARXIII] Click POWER button, then play keyboard.');
+            } catch (e) {
+                console.error('[MODULARXIII] FATAL: UI init failed:', e);
+                alert('MODULARXIII UI failed to init:\n' + e.message);
+            }
         }
     }
 
     window.addEventListener('DOMContentLoaded', () => {
-        window.app = new App();
+        try {
+            window.app = new App();
+        } catch (e) {
+            console.error('[MODULARXIII] FATAL on DOMContentLoaded:', e);
+        }
     });
     </script>
 </body>

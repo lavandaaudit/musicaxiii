@@ -654,6 +654,120 @@ canvas {
     background: #555;
 }
 
+/* ---------- Modal (patch library) ---------- */
+.modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.75);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.modal.hidden {
+    display: none;
+}
+
+.modal-content {
+    background: var(--panel-bg);
+    border: 1px solid var(--accent-color);
+    box-shadow: 0 0 25px rgba(0, 255, 204, 0.25);
+    border-radius: 4px;
+    padding: 16px;
+    width: 540px;
+    max-width: 92vw;
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.modal-header h3 {
+    font-family: var(--font-heading);
+    color: var(--accent-color);
+    font-size: 1rem;
+    letter-spacing: 1px;
+}
+
+.modal-close {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    font-size: 1.6rem;
+    cursor: pointer;
+    padding: 0 8px;
+    line-height: 1;
+}
+
+.modal-close:hover {
+    color: var(--secondary-accent);
+    box-shadow: none;
+    background: transparent;
+}
+
+.patch-slot {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.patch-slot input.patch-name {
+    flex: 1;
+    background: #050505;
+    color: var(--accent-color);
+    border: 1px solid var(--border-color);
+    padding: 4px 8px;
+    font-family: var(--font-heading);
+    font-size: 0.7rem;
+    border-radius: 2px;
+    min-width: 100px;
+}
+
+.patch-info {
+    color: var(--text-dim);
+    font-size: 0.6rem;
+    min-width: 140px;
+    text-align: center;
+    font-family: var(--font-heading);
+}
+
+.patch-slot button {
+    padding: 4px 8px;
+    font-size: 0.6rem;
+    min-width: 50px;
+}
+
+.patch-slot button:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+}
+
+/* ---------- REC button ---------- */
+button.rec.active {
+    background: var(--secondary-accent);
+    color: #fff;
+    border-color: var(--secondary-accent);
+    box-shadow: 0 0 10px var(--secondary-accent);
+    animation: rec-pulse 1s infinite;
+}
+
+@keyframes rec-pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.55; }
+    100% { opacity: 1; }
+}
+
 /* ---------- Responsive ---------- */
 @media (max-width: 900px) {
     .main-area {
