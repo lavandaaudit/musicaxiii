@@ -36,11 +36,11 @@
                     <label>BPM</label>
                     <input type="number" id="bpm-input" value="90" min="30" max="240">
                 </div>
-                <span style="color:#555; font-size:0.6rem;">Master clock — each channel has its own 16-step sequencer below the channel controls. Click a piano key first, then click a step in the channel to place a note.</span>
+                <span style="color:#555; font-size:0.55rem;">Master clock — each channel has its own sequencer visible below. Click a piano key first to select a note, then click step cells. DRONE on a channel = sustained notes; sequencer on a channel = rhythmic pattern.</span>
             </div>
-            <div style="padding:6px 8px; display:flex; gap:4px; align-items:center;">
-                <span style="color:var(--text-dim); font-size:0.6rem; font-family:var(--font-heading); letter-spacing:1px;">MASTER STEP:</span>
-                <div id="master-step-display" style="display:flex; gap:1px; flex:1; height:18px;"></div>
+            <div style="padding:2px 6px; display:flex; gap:4px; align-items:center; height:18px;">
+                <span style="color:var(--text-dim); font-size:0.55rem; font-family:var(--font-heading); letter-spacing:1px;">STEP:</span>
+                <div id="master-step-display" style="display:flex; gap:1px; flex:1; height:10px;"></div>
             </div>
         </section>
 
@@ -49,8 +49,8 @@
             <!-- LEFT: Oscillator Bank -->
             <section class="module osc-bank-section">
                 <div class="osc-bank-header">
-                    <h2>OSCILLATOR BANK — Each column = independent channel (filter + ADSR + FX)</h2>
-                    <button id="add-osc-btn" class="add-btn">+ ADD OSC</button>
+                    <h2>OSCILLATOR BANK — each column = independent channel (filter + ADSR + FX + sequencer)</h2>
+                    <button id="add-osc-btn" class="add-btn">+ ADD</button>
                 </div>
                 <div class="osc-bank-scroll">
                     <div class="osc-bank" id="osc-bank"></div>
@@ -1199,7 +1199,8 @@
 
         // Called by master transport for every master step
         processMasterStep(masterStep, time) {
-            if (!this.enabled) return;
+            // Gate on channel active state — if channel is muted, sequencer is silent
+            if (!this.channel.config.active) return;
             const localStep = masterStep % this.length;
             const step = this.steps[localStep];
             // Visual update
@@ -1209,7 +1210,9 @@
                     if (this.onStepChange) this.onStepChange(localStep);
                 }, delay);
             }
-            // Audio: if active, schedule a note
+            // Audio: if active, schedule a note. Drone mode is handled inside the
+            // channel's noteOn/noteOff — noteOff is a no-op when droneMode is on,
+            // so the sequencer note effectively becomes a sustained drone hit.
             if (step.active && step.note) {
                 const secPerBeat = 60.0 / this.channel.core.sequencer.tempo;
                 const duration = 0.25 * secPerBeat * 0.9; // ~one 16th note
@@ -1823,36 +1826,35 @@
         }
 
         // ===== Channel Sequencer UI =====
+        // Sequencer is always visible under the channel. It auto-plays when:
+        //   1) channel is ON (not muted), AND
+        //   2) master transport is PLAYING
+        // DRONE mode takes precedence — when DRONE is on, the sequencer still
+        // plays its pattern, but each triggered note sustains (drone behavior).
         makeChannelSequencer(ch) {
             const sec = this.makeSection('SEQUENCER');
             const seq = ch.sequencer;
+            // Sequencer is always enabled; channel's `active` state gates actual playback.
+            // This way mute on a channel also silences its sequencer — no surprise audio.
+            seq.enabled = true;
 
-            // Controls: ENABLE toggle, length selector, CLEAR
+            // Compact controls row: just length selector + clear
             const ctrl = document.createElement('div');
             ctrl.className = 'ch-seq-controls';
 
-            const enBtn = document.createElement('button');
-            enBtn.textContent = 'RUN';
-            enBtn.classList.toggle('active', seq.enabled);
-            enBtn.title = 'Enable this channel\'s sequencer (master transport must be PLAYING)';
-            enBtn.addEventListener('click', () => {
-                const newState = !seq.enabled;
-                seq.setEnabled(newState);
-                enBtn.classList.toggle('active', newState);
-            });
-
             const lenSel = document.createElement('select');
             [
-                { v: 8, t: '8 STEPS' },
-                { v: 12, t: '12 STEPS' },
-                { v: 16, t: '16 STEPS' },
-                { v: 32, t: '32 STEPS' }
+                { v: 8, t: '8' },
+                { v: 12, t: '12' },
+                { v: 16, t: '16' },
+                { v: 32, t: '32' }
             ].forEach(o => {
                 const opt = document.createElement('option');
-                opt.value = o.v; opt.textContent = o.t;
+                opt.value = o.v; opt.textContent = o.t + ' STEP';
                 lenSel.appendChild(opt);
             });
             lenSel.value = String(seq.length);
+            lenSel.title = 'Pattern length (longer = polyrhythm against other channels)';
             lenSel.addEventListener('change', e => {
                 seq.setLength(parseInt(e.target.value));
                 this.refreshChannelSeqUI(ch);
@@ -1866,12 +1868,11 @@
                 this.refreshChannelSeqUI(ch);
             });
 
-            ctrl.appendChild(enBtn);
             ctrl.appendChild(lenSel);
             ctrl.appendChild(clrBtn);
             sec.appendChild(ctrl);
 
-            // Step grid (max 32 — visually shows 16, scroll if more)
+            // Step grid (always 16 cells visible; 32 wraps to 2 rows)
             const grid = document.createElement('div');
             grid.className = 'ch-seq-grid';
             grid.style.gridTemplateColumns = seq.length > 16 ? 'repeat(16, 1fr)' : `repeat(${seq.length}, 1fr)`;
@@ -2049,9 +2050,9 @@
                 523.25, 554.37, 587.33, 622.25, 659.25, 698.46, 739.99, 783.99, 830.61, 880.00, 932.33, 987.77  // C5..B5
             ];
             const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-            const whiteWidth = 22;
-            const blackWidth = 14;
-            const blackOffset = 15;
+            const whiteWidth = 18;
+            const blackWidth = 11;
+            const blackOffset = 12;
 
             const keysHolder = document.createElement('div');
             keysHolder.style.position = 'relative';
